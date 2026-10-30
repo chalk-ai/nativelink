@@ -110,6 +110,70 @@ struct SampledResourceUsage {
     cpu_time_ms: u64,
 }
 
+/// One process's entry in a `/proc` snapshot.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct ProcStat {
+    pid: u32,
+    pgid: u32,
+    cpu_ticks: Option<u64>,
+}
+
+/// A `/proc` snapshot shared by every action sampler on this worker.
+///
+/// Each running action samples its process group every
+/// `RESOURCE_USAGE_SAMPLE_INTERVAL`, and finding the group's members means
+/// reading `/proc/<pid>/stat` for every process on the host. Scanning once per
+/// action makes the cost (running actions) x (host processes) per interval,
+/// which on a busy shared host saturates dozens of cores. Samplers instead
+/// reuse a snapshot younger than one interval, so the host is scanned at most
+/// once per interval however many actions run.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct ProcessTableCache {
+    snapshot: tokio::sync::Mutex<Option<(std::time::Instant, Arc<[ProcStat]>)>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessTableCache {
+    /// Returns a snapshot at most one sample interval old. Callers that arrive
+    /// while a scan is running wait for it rather than starting their own.
+    async fn current(&self) -> Arc<[ProcStat]> {
+        let mut snapshot = self.snapshot.lock().await;
+        if let Some((taken_at, entries)) = snapshot.as_ref()
+            && taken_at.elapsed() < RESOURCE_USAGE_SAMPLE_INTERVAL
+        {
+            return entries.clone();
+        }
+        // The scan is thousands of blocking reads; keep it off the async workers.
+        let entries: Arc<[ProcStat]> = spawn_blocking!("process_table_scan", scan_process_table)
+            .await
+            .map_or_else(|_| Arc::from(Vec::new()), Arc::from);
+        *snapshot = Some((std::time::Instant::now(), entries.clone()));
+        entries
+    }
+}
+
+/// Reads the pid, process group and CPU ticks of every process `/proc` lists.
+#[cfg(target_os = "linux")]
+fn scan_process_table() -> Vec<ProcStat> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            Some(ProcStat {
+                pid,
+                pgid: parse_pgid_from_stat(&stat)?,
+                cpu_ticks: parse_cpu_ticks_from_stat(&stat),
+            })
+        })
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
 struct ActionResourceUsageSampler {
     stop_tx: watch::Sender<bool>,
@@ -117,11 +181,14 @@ struct ActionResourceUsageSampler {
 }
 
 #[cfg(target_os = "linux")]
-fn start_action_resource_usage_sampler(pgid: u32) -> ActionResourceUsageSampler {
+fn start_action_resource_usage_sampler(
+    pgid: u32,
+    process_table: Arc<ProcessTableCache>,
+) -> ActionResourceUsageSampler {
     let (stop_tx, stop_rx) = watch::channel(false);
     let handle = background_spawn!(
         "action_resource_usage_sampler",
-        sample_action_resource_usage(pgid, stop_rx)
+        sample_action_resource_usage(pgid, process_table, stop_rx)
     );
     ActionResourceUsageSampler { stop_tx, handle }
 }
@@ -137,6 +204,7 @@ async fn finish_action_resource_usage_sampler(
 #[cfg(target_os = "linux")]
 async fn sample_action_resource_usage(
     pgid: u32,
+    process_table: Arc<ProcessTableCache>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> SampledResourceUsage {
     let mut peak_memory_kb = 0;
@@ -146,8 +214,12 @@ async fn sample_action_resource_usage(
     // the end instead.
     let mut cpu_ticks_by_pid = HashMap::new();
 
-    let sample = |peak_memory_kb: &mut u64, cpu_ticks_by_pid: &mut HashMap<u32, u64>| {
-        let observed = sample_process_group(pgid, cpu_ticks_by_pid);
+    // A snapshot can be up to one interval old, the same staleness the
+    // per-interval sampling already has, so a member that lives and exits
+    // between scans is missed either way.
+    let sample = async |peak_memory_kb: &mut u64, cpu_ticks_by_pid: &mut HashMap<u32, u64>| {
+        let table = process_table.current().await;
+        let observed = sample_process_group(pgid, &table, cpu_ticks_by_pid);
         if let Some(memory_kb) = observed {
             *peak_memory_kb = (*peak_memory_kb).max(memory_kb);
         }
@@ -155,7 +227,9 @@ async fn sample_action_resource_usage(
     };
 
     loop {
-        if sample(&mut peak_memory_kb, &mut cpu_ticks_by_pid).is_none()
+        if sample(&mut peak_memory_kb, &mut cpu_ticks_by_pid)
+            .await
+            .is_none()
             && !Path::new(&format!("/proc/{pgid}")).exists()
         {
             // The group leader has been reaped and no member process remains,
@@ -170,7 +244,7 @@ async fn sample_action_resource_usage(
         tokio::select! {
             changed = stop_rx.changed() => {
                 if changed.is_ok() && *stop_rx.borrow() {
-                    sample(&mut peak_memory_kb, &mut cpu_ticks_by_pid);
+                    sample(&mut peak_memory_kb, &mut cpu_ticks_by_pid).await;
                     break;
                 }
             }
@@ -209,24 +283,16 @@ fn ticks_to_millis(ticks: u64) -> u64 {
 /// inherited and survives reparenting, and excludes the worker's own group.
 /// Returns `None` when no member process can be read (the group is empty).
 #[cfg(target_os = "linux")]
-fn sample_process_group(pgid: u32, cpu_ticks_by_pid: &mut HashMap<u32, u64>) -> Option<u64> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return None;
-    };
-
+fn sample_process_group(
+    pgid: u32,
+    process_table: &[ProcStat],
+    cpu_ticks_by_pid: &mut HashMap<u32, u64>,
+) -> Option<u64> {
     let mut total_kb = 0;
     let mut found_any_process = false;
-    for entry in entries.flatten() {
-        let Ok(member_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{member_pid}/stat")) else {
-            continue;
-        };
-        if parse_pgid_from_stat(&stat) != Some(pgid) {
-            continue;
-        }
-        if let Some(ticks) = parse_cpu_ticks_from_stat(&stat) {
+    for member in process_table.iter().filter(|entry| entry.pgid == pgid) {
+        let member_pid = member.pid;
+        if let Some(ticks) = member.cpu_ticks {
             // Monotonic per process, but a pid could in principle be reused
             // within one action, so never let the figure go backwards.
             let entry = cpu_ticks_by_pid.entry(member_pid).or_insert(0);
@@ -1973,8 +2039,12 @@ impl RunningActionImpl {
         );
 
         #[cfg(target_os = "linux")]
-        let mut maybe_resource_usage_sampler =
-            child_process.id().map(start_action_resource_usage_sampler);
+        let mut maybe_resource_usage_sampler = child_process.id().map(|pgid| {
+            start_action_resource_usage_sampler(
+                pgid,
+                self.running_actions_manager.process_table.clone(),
+            )
+        });
 
         let mut child_process_guard = guard(child_process, |mut child_process| {
             let result: Result<Option<std::process::ExitStatus>, std::io::Error> =
@@ -3089,6 +3159,9 @@ pub struct RunningActionsManagerImpl {
     timeout_handled_externally: bool,
     #[cfg(target_os = "linux")]
     use_namespaces: UseNamespaces,
+    /// The `/proc` snapshot every action's resource-usage sampler shares.
+    #[cfg(target_os = "linux")]
+    process_table: Arc<ProcessTableCache>,
     running_actions: Mutex<HashMap<OperationId, Weak<RunningActionImpl>>>,
     // Note: We don't use Notify because we need to support a .wait_for()-like function, which
     // Notify does not support.
@@ -3160,6 +3233,8 @@ impl RunningActionsManagerImpl {
             persistent_worker_pool: PersistentWorkerPool::default(),
             #[cfg(target_os = "linux")]
             use_namespaces: args.use_namespaces,
+            #[cfg(target_os = "linux")]
+            process_table: Arc::new(ProcessTableCache::default()),
         })
     }
 
